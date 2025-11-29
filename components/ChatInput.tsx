@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { SendIcon, MicrophoneIcon } from './Icons';
-import { GoogleGenAI, LiveSession, LiveServerMessage, Blob, Modality } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Blob, Modality } from '@google/genai';
 
 // --- START: Fix for Web Speech API types not being in default TypeScript lib ---
 // By defining these interfaces, we can use the Web Speech API without compilation errors.
@@ -85,13 +85,18 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
   const [shouldStartListening, setShouldStartListening] = useState(false);
 
   // Refs for audio processing and API session
-  const sessionPromiseRef = useRef<Promise<LiveSession> | null>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const currentTranscriptionRef = useRef('');
   const speechRecognitionRef = useRef<SpeechRecognition | null>(null);
   
+  const listeningStateRef = useRef(listeningState);
+  useEffect(() => {
+    listeningStateRef.current = listeningState;
+  }, [listeningState]);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Use a ref for onSend to avoid stale closures in callbacks
@@ -244,7 +249,7 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
                     stopListening();
                 },
                 onclose: () => {
-                    if (listeningState === 'listening' || listeningState === 'connecting') {
+                    if (listeningStateRef.current === 'listening' || listeningStateRef.current === 'connecting') {
                        stopListening();
                     }
                 },

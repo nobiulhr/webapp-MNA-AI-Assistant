@@ -2,15 +2,6 @@ const CACHE_NAME = 'mna-ai-assistant-v1';
 const urlsToCache = [
   '/',
   '/index.html',
-  '/index.tsx',
-  '/App.tsx',
-  '/types.ts',
-  '/components/ActionItemsList.tsx',
-  '/components/ChatInput.tsx',
-  '/components/ChatMessage.tsx',
-  '/components/ExportOptions.tsx',
-  '/components/Icons.tsx',
-  '/services/geminiService.ts',
   '/icon.svg',
   '/manifest.json'
 ];
