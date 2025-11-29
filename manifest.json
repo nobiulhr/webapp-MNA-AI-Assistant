@@ -1,0 +1,18 @@
+{
+  "name": "MNA AI Assistant",
+  "short_name": "MNA AI",
+  "description": "An AI-powered work assistant to help users capture and organize tasks from their spoken or written notes. It identifies action items and deadlines, asks clarifying questions, and generates summaries on demand.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

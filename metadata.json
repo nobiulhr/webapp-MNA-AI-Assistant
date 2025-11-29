@@ -1,0 +1,7 @@
+{
+  "name": "MNA AI Assistant",
+  "description": "An AI-powered work assistant to help users capture and organize tasks from their spoken or written notes. It identifies action items and deadlines, asks clarifying questions, and generates summaries on demand.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
