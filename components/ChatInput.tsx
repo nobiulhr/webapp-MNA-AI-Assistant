@@ -3,19 +3,21 @@ import { SendIcon, MicrophoneIcon } from './Icons';
 import { GoogleGenAI, LiveServerMessage, Blob, Modality } from '@google/genai';
 
 // --- START: Fix for Web Speech API types not being in default TypeScript lib ---
-// By defining these interfaces, we can use the Web Speech API without compilation errors.
 interface SpeechRecognition extends EventTarget {
   continuous: boolean;
   interimResults: boolean;
+  lang: string;
   onresult: ((ev: SpeechRecognitionEvent) => any) | null;
   onerror: ((ev: SpeechRecognitionErrorEvent) => any) | null;
   onend: (() => any) | null;
   start(): void;
   stop(): void;
+  abort(): void;
 }
 
 interface SpeechRecognitionEvent extends Event {
   readonly results: SpeechRecognitionResultList;
+  readonly resultIndex: number;
 }
 
 interface SpeechRecognitionResultList {
@@ -26,6 +28,7 @@ interface SpeechRecognitionResultList {
 
 interface SpeechRecognitionResult {
   readonly length: number;
+  readonly isFinal: boolean;
   item(index: number): SpeechRecognitionAlternative;
   [index: number]: SpeechRecognitionAlternative;
 }
@@ -49,7 +52,7 @@ declare var webkitSpeechRecognition: {
 };
 // --- END: Fix for Web Speech API types ---
 
-// --- START: Audio utility functions from Gemini documentation ---
+// --- START: Audio utility functions ---
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
@@ -63,7 +66,10 @@ function createBlob(data: Float32Array): Blob {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {
-    int16[i] = data[i] * 32768;
+    // Clip the data to be within [-1, 1] to prevent overflow/distortion
+    const s = Math.max(-1, Math.min(1, data[i]));
+    // Convert to 16-bit PCM
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
   }
   return {
     data: encode(new Uint8Array(int16.buffer)),
@@ -71,6 +77,8 @@ function createBlob(data: Float32Array): Blob {
   };
 }
 // --- END: Audio utility functions ---
+
+type ListeningState = 'idle' | 'requesting_permission' | 'initializing_audio' | 'connecting' | 'listening' | 'error';
 
 interface ChatInputProps {
   onSend: (message: string) => void;
@@ -80,17 +88,22 @@ interface ChatInputProps {
 
 const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => {
   const [inputValue, setInputValue] = useState('');
-  const [listeningState, setListeningState] = useState<'idle' | 'connecting' | 'listening' | 'error'>('idle');
+  const [listeningState, setListeningState] = useState<ListeningState>('idle');
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [shouldStartListening, setShouldStartListening] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   // Refs for audio processing and API session
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const currentTranscriptionRef = useRef('');
   const speechRecognitionRef = useRef<SpeechRecognition | null>(null);
+  const connectionTimeoutRef = useRef<any>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const wakeWordRetryCountRef = useRef(0);
   
   const listeningStateRef = useRef(listeningState);
   useEffect(() => {
@@ -105,6 +118,29 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
   const onErrorRef = useRef(onError);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
+  // Audio visualization loop
+  const updateAudioLevel = useCallback(() => {
+    if (listeningStateRef.current === 'listening' && analyserRef.current) {
+        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteFrequencyData(dataArray);
+        
+        // Calculate average volume
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+        
+        // Smooth scaling factor (0 to 1 range roughly)
+        // normalized for visual effect
+        setAudioLevel(Math.min(100, average * 2));
+        
+        animationFrameRef.current = requestAnimationFrame(updateAudioLevel);
+    } else {
+        setAudioLevel(0);
+    }
+  }, []);
+
   const stopWakeWordListener = useCallback(() => {
     if (speechRecognitionRef.current) {
       const recognition = speechRecognitionRef.current;
@@ -113,15 +149,26 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
       recognition.onend = null;
       recognition.onerror = null;
       try {
-        recognition.stop();
+        // use abort() instead of stop() for immediate release of the mic
+        recognition.abort(); 
       } catch (e) {
-        console.warn("Speech recognition may have already been stopped.", e);
+        // Ignore errors when stopping
       }
     }
   }, []);
 
   const stopListening = useCallback(async () => {
+    if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+    }
+    if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+    }
+
     setListeningState('idle');
+    setAudioLevel(0);
     currentTranscriptionRef.current = '';
 
     if (mediaStreamRef.current) {
@@ -132,11 +179,17 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         scriptProcessorRef.current.disconnect();
         scriptProcessorRef.current = null;
     }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        try {
-            await audioContextRef.current.close();
-        } catch(e) {
-            console.warn("AudioContext already closed.", e);
+    if (analyserRef.current) {
+        analyserRef.current.disconnect();
+        analyserRef.current = null;
+    }
+    if (audioContextRef.current) {
+        if (audioContextRef.current.state !== 'closed') {
+            try {
+                await audioContextRef.current.close();
+            } catch(e) {
+                console.warn("AudioContext already closed.", e);
+            }
         }
         audioContextRef.current = null;
     }
@@ -149,13 +202,14 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         }
         sessionPromiseRef.current = null;
     }
+    
     // After stopping, start wake word listener if permission is granted
     // We wrap this in a timeout to ensure the state has updated before restarting
     setTimeout(() => {
         if (micPermission === 'granted') {
             startWakeWordListener();
         }
-    }, 100);
+    }, 500);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [micPermission]);
 
@@ -171,54 +225,87 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         return;
     }
     
+    // Stop wake word listener and wait a bit for the OS to release the microphone
     stopWakeWordListener();
+    await new Promise(resolve => setTimeout(resolve, 300));
 
     try {
+        setListeningState('requesting_permission');
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         mediaStreamRef.current = stream;
         setMicPermission('granted');
-        setListeningState('connecting');
 
+        setListeningState('initializing_audio');
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        audioContextRef.current = new AudioContextClass({ sampleRate: 16000 });
+        
+        // Resume AudioContext if suspended (browser policy)
+        if (audioContextRef.current.state === 'suspended') {
+            await audioContextRef.current.resume();
+        }
+
         currentTranscriptionRef.current = '';
+
+        setListeningState('connecting');
+        // Safety timeout in case connection hangs
+        connectionTimeoutRef.current = setTimeout(() => {
+            if (listeningStateRef.current === 'connecting' || listeningStateRef.current === 'initializing_audio') {
+                console.error("Connection timed out");
+                onErrorRef.current("Connection timed out. Please check your network.");
+                stopListening();
+            }
+        }, 10000);
 
         sessionPromiseRef.current = ai.live.connect({
             model: 'gemini-2.5-flash-native-audio-preview-09-2025',
             callbacks: {
                 onopen: () => {
+                    if (connectionTimeoutRef.current) {
+                        clearTimeout(connectionTimeoutRef.current);
+                        connectionTimeoutRef.current = null;
+                    }
+
                     setListeningState('listening');
                     if (!audioContextRef.current || !mediaStreamRef.current) return;
 
                     const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
+                    
+                    // Add Analyser for visualization
+                    analyserRef.current = audioContextRef.current.createAnalyser();
+                    analyserRef.current.fftSize = 256;
+                    
                     scriptProcessorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
                     
                     scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
                         const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
                         const pcmBlob = createBlob(inputData);
                         
-                        sessionPromiseRef.current?.then((session) => {
-                            session.sendRealtimeInput({ media: pcmBlob });
-                        });
+                        // Check if sessionPromiseRef still exists (user might have stopped listening)
+                        if (sessionPromiseRef.current) {
+                            sessionPromiseRef.current.then((session) => {
+                                session.sendRealtimeInput({ media: pcmBlob });
+                            });
+                        }
                     };
                     
-                    source.connect(scriptProcessorRef.current);
+                    // Connect graph: Source -> Analyser -> ScriptProcessor -> Destination
+                    source.connect(analyserRef.current);
+                    analyserRef.current.connect(scriptProcessorRef.current);
                     scriptProcessorRef.current.connect(audioContextRef.current.destination);
+
+                    // Start visualization loop
+                    updateAudioLevel();
                 },
                 onmessage: (message: LiveServerMessage) => {
                     if (message.serverContent?.inputTranscription) {
-                        // The API sends transcription chunks. We accumulate them in a ref
-                        // and update the input state to show the live transcript.
                         const { text } = message.serverContent.inputTranscription;
                         currentTranscriptionRef.current += text;
                         setInputValue(currentTranscriptionRef.current);
                     }
 
                     if (message.serverContent?.turnComplete) {
-                        // When the user pauses, `turnComplete` is sent. We check the full
-                        // accumulated transcript for commands. We do NOT reset the transcript
-                        // here unless a command requires it, allowing for multi-utterance notes.
                         const fullTranscript = currentTranscriptionRef.current.trim();
                         
                         const sendRegex = /\b(send|done)\.?$/i;
@@ -229,21 +316,20 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
                             const taskText = fullTranscript.replace(sendRegex, '').trim();
                             if (taskText) onSendRef.current(taskText);
                             setInputValue('');
-                            stopListening(); // stopListening handles resetting the ref
+                            stopListening();
                         } else if (stopRecordingRegex.test(fullTranscript)) {
                             const taskText = fullTranscript.replace(stopRecordingRegex, '').trim();
                             setInputValue(taskText);
-                            stopListening(); // stopListening handles resetting the ref
+                            stopListening();
                         } else if (clearInputRegex.test(fullTranscript)) {
                             setInputValue('');
-                            currentTranscriptionRef.current = ''; // Explicitly clear the ref
+                            currentTranscriptionRef.current = '';
                         }
-                        // If no command is found, we do nothing and let the transcription accumulate.
                     }
                 },
                 onerror: (e: ErrorEvent) => {
                     console.error("Live session error:", e);
-                    const errorMsg = "A connection error occurred with the voice service. This could be due to a network issue, a misconfigured API key, or a temporary service problem. Please check your connection and configuration, then try again.";
+                    const errorMsg = "A connection error occurred. Please try again.";
                     onErrorRef.current(errorMsg);
                     setListeningState('error');
                     stopListening();
@@ -257,6 +343,7 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
             config: {
                 inputAudioTranscription: {},
                 responseModalities: [Modality.AUDIO],
+                systemInstruction: "You are MNA. You MUST always speak and respond in clear, professional English. Do not use any other language, even if the user speaks to you in a different language.",
             },
         });
 
@@ -265,11 +352,13 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         setListeningState('error');
         if (err instanceof DOMException && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
             setMicPermission('denied');
+        } else {
+             onErrorRef.current("Could not access microphone or start audio. Please check permissions.");
         }
         await stopListening();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listeningState, stopWakeWordListener, stopListening]);
+  }, [listeningState, stopWakeWordListener, stopListening, updateAudioLevel]);
 
   const startWakeWordListener = useCallback(() => {
     if (listeningState !== 'idle' || micPermission !== 'granted' || speechRecognitionRef.current) {
@@ -277,44 +366,80 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
     }
     const SpeechRecognitionAPI = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
     if (!SpeechRecognitionAPI) {
-        console.warn("Speech Recognition API not supported in this browser.");
         return;
     }
 
-    console.log("Starting wake word listener...");
     const recognition = new SpeechRecognitionAPI();
     recognition.continuous = true;
-    recognition.interimResults = false;
+    recognition.interimResults = true; // Use interim results for faster detection
+    recognition.lang = 'en-US'; // Strictly enforce English for wake word detection
 
+    // Reset retry count on fresh start attempt
+    // However, we don't reset inside onend, only when manually starting from scratch
+    // or when we have a successful result.
+    
     recognition.onresult = (event: SpeechRecognitionEvent) => {
-      const last = event.results.length - 1;
-      const transcript = event.results[last][0].transcript.trim().toLowerCase();
-      const wakeWordRegex = /\b(hey|start)\b/i;
-      
-      if (wakeWordRegex.test(transcript)) {
-        console.log(`Wake word detected: "${transcript}"`);
-        setShouldStartListening(true);
-      }
+        wakeWordRetryCountRef.current = 0; // Success! Reset retry count.
+
+        let transcript = '';
+        // Concatenate all results, including interim ones
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            transcript += event.results[i][0].transcript;
+        }
+        const lower = transcript.toLowerCase();
+        
+        // Check for wake word
+        if (/\b(hey|start)\b/i.test(lower)) {
+            setShouldStartListening(true);
+            recognition.abort(); // Immediately stop/release mic once detected
+        }
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      console.error('Wake word recognition error:', event.error);
-      if (event.error === 'not-allowed') {
-        setMicPermission('denied');
+      // Handle backoff for specific errors
+      if (event.error === 'audio-capture' || event.error === 'network') {
+          wakeWordRetryCountRef.current += 1;
+          return; // Allow onend to handle the restart with backoff
       }
-      stopWakeWordListener();
+
+      if (
+          event.error === 'no-speech' || 
+          event.error === 'aborted' 
+      ) {
+        return;
+      }
+
+      console.error('Wake word recognition error:', event.error);
+      
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        // Permission related, stop trying
+      }
     };
 
     recognition.onend = () => {
-      // Only restart if it wasn't intentionally stopped
       if (speechRecognitionRef.current === recognition) {
-        console.log("Wake word listener ended, restarting.");
-        try {
-          recognition.start();
-        } catch (e) {
-          console.error("Could not restart wake word listener", e);
-          stopWakeWordListener();
+        // Calculate backoff delay
+        // Base delay 300ms. If retry > 0, backoff exponentially: 300, 1000, 2000, 4000...
+        let delay = 300;
+        if (wakeWordRetryCountRef.current > 0) {
+            delay = Math.min(500 * Math.pow(2, wakeWordRetryCountRef.current), 30000); // Cap at 30s
+            // Only log if we are backing off significantly
+            if (delay > 1000) {
+                console.warn(`Wake word listener backing off for ${delay}ms (retry ${wakeWordRetryCountRef.current}) due to errors.`);
+            }
         }
+
+        setTimeout(() => {
+             if (speechRecognitionRef.current === recognition) {
+                 try {
+                     recognition.start();
+                 } catch (e) {
+                     // If start fails immediately, we let the next onerror/onend cycle handle it
+                     // or stop if it throws synchronously
+                     console.error("Failed to restart wake word listener:", e);
+                 }
+             }
+        }, delay);
       }
     };
 
@@ -331,8 +456,14 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
   useEffect(() => {
     if ('permissions' in navigator) {
         navigator.permissions.query({ name: 'microphone' as PermissionName }).then((permissionStatus) => {
-            setMicPermission(permissionStatus.state);
-            permissionStatus.onchange = () => setMicPermission(permissionStatus.state);
+            if (permissionStatus.state === 'granted') {
+                setMicPermission('granted');
+            }
+            permissionStatus.onchange = () => {
+                 if (permissionStatus.state === 'granted') {
+                     setMicPermission('granted');
+                 }
+            };
         });
     }
   }, []);
@@ -340,11 +471,12 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
   // Effect to manage the wake word listener based on state
   useEffect(() => {
     if (micPermission === 'granted' && listeningState === 'idle') {
+      // When entering idle state with permission, reset retries
+      wakeWordRetryCountRef.current = 0;
       startWakeWordListener();
     } else {
       stopWakeWordListener();
     }
-    // Cleanup function to stop listener when dependencies change
     return () => {
         stopWakeWordListener();
     }
@@ -360,6 +492,8 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+        if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
         stopListening();
         stopWakeWordListener();
     };
@@ -391,7 +525,7 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
   };
 
   const handleMicClick = () => {
-    if (listeningState === 'listening' || listeningState === 'connecting') {
+    if (listeningState === 'listening' || listeningState === 'connecting' || listeningState === 'initializing_audio' || listeningState === 'requesting_permission') {
       stopListening();
     } else {
       startListening();
@@ -402,11 +536,14 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
     if (micPermission === 'denied') {
       return "Microphone access denied.";
     }
-    if (listeningState === 'connecting') {
+    if (listeningState === 'requesting_permission') {
+        return "Please allow microphone access...";
+    }
+    if (listeningState === 'connecting' || listeningState === 'initializing_audio') {
         return "Connecting to MNA's ears...";
     }
     if (listeningState === 'listening') {
-      return "Listening... Say 'send' when you're done.";
+      return "Listening... Say 'send' when done.";
     }
     if (listeningState === 'error') {
         return "Connection error. Click mic to retry.";
@@ -417,12 +554,38 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
     return "Click the mic to start speaking...";
   };
   
-  const isMicActive = listeningState === 'listening' || listeningState === 'connecting';
+  const isMicActive = listeningState === 'listening' || listeningState === 'connecting' || listeningState === 'initializing_audio' || listeningState === 'requesting_permission';
+
+  const getStatusBadge = () => {
+      switch (listeningState) {
+          case 'requesting_permission':
+              return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-yellow-500/20 text-yellow-300 rounded-full animate-pulse border border-yellow-500/30">Requesting Mic Access...</span>;
+          case 'initializing_audio':
+              return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-indigo-500/20 text-indigo-300 rounded-full animate-pulse border border-indigo-500/30">Initializing Audio...</span>;
+          case 'connecting':
+              return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-indigo-500/20 text-indigo-300 rounded-full animate-pulse border border-indigo-500/30">Connecting to AI...</span>;
+          case 'listening':
+               return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-red-500/20 text-red-300 rounded-full border border-red-500/30 flex items-center gap-1">
+                   <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
+                   Listening
+               </span>;
+          case 'error':
+               return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-red-900/40 text-red-300 rounded-full border border-red-500/30">Connection Failed</span>;
+           case 'idle':
+               if (micPermission === 'granted') {
+                    return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-emerald-500/10 text-emerald-400 rounded-full border border-emerald-500/20">Wake Word Active: "Hey" or "Start"</span>;
+               }
+               return null;
+          default:
+              return null;
+      }
+  };
 
   return (
     <div className="bg-slate-800/80 backdrop-blur-sm p-4 border-t border-slate-700">
       <div className="max-w-4xl mx-auto">
         <div className="relative">
+          {getStatusBadge()}
           <textarea
             ref={textareaRef}
             value={inputValue}
@@ -438,16 +601,33 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
             <button
               onClick={handleMicClick}
               disabled={isLoading || micPermission === 'denied'}
-              className={`p-2 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed ${
-                listeningState === 'listening'
-                  ? 'text-red-500 animate-pulse bg-red-500/20'
-                  : isMicActive
-                  ? 'text-indigo-400 bg-indigo-500/10'
-                  : 'text-slate-300 hover:text-white hover:bg-slate-700'
-              }`}
+              className="relative p-2 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed group"
               aria-label={isMicActive ? "Stop listening" : "Start listening"}
+              title={micPermission === 'granted' && !isMicActive ? "Wake word active" : "Start listening"}
             >
-              <MicrophoneIcon className="w-6 h-6" />
+              {/* Dynamic visualizer ring */}
+              {listeningState === 'listening' && (
+                  <div 
+                    className="absolute inset-0 rounded-full bg-red-500 opacity-20 transition-transform duration-75"
+                    style={{ transform: `scale(${1 + audioLevel / 40})` }}
+                  ></div>
+              )}
+               {/* Static Wake Word ring */}
+               {listeningState === 'idle' && micPermission === 'granted' && (
+                  <div className="absolute inset-0 rounded-full border border-emerald-500/30 opacity-100"></div>
+              )}
+
+              <div className={`relative z-10 ${
+                listeningState === 'listening'
+                  ? 'text-red-400'
+                  : isMicActive
+                  ? 'text-indigo-400 animate-pulse'
+                  : micPermission === 'granted'
+                  ? 'text-emerald-400'
+                  : 'text-slate-300 hover:text-white'
+              }`}>
+                <MicrophoneIcon className="w-6 h-6" />
+              </div>
             </button>
             <button
               onClick={handleSend}

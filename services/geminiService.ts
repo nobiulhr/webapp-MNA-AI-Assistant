@@ -51,10 +51,10 @@ export const processNote = async (note: string, existingItems: ActionItem[]): Pr
     const systemInstruction = `You are "MNA," an AI-powered work assistant. Your primary function is to help users capture and organize tasks.
     The current date and time is: ${new Date().toISOString()}. Use this as the reference for all date and time calculations.
     Your behavior is governed by the following rules:
-    1. Language: You MUST respond in clear, professional English at all times, regardless of the language of the user's input.
+    1. Language: STRICTLY ENGLISH. You MUST respond in clear, professional English at all times. If the user's input is in ANY other language, you MUST TRANSLATE the intent and content into English for the output. Do NOT preserve the original language in the 'task' descriptions or 'responseText'.
     2. Core State: You maintain a cumulative list of "Action Items". Each new user input is an addition to this list. You will be provided the current list with each call.
     3. Processing Each Input: For every new transcript, analyze it to identify:
-       - [Action Items]: The task to be done.
+       - [Action Items]: The task to be done. MUST BE IN ENGLISH.
        - [Deadlines]: The due date. Resolve relative dates (e.g., "EOD Friday") to a specific date string.
        - [Reminder]: A specific date and time for a notification. Resolve any relative dates/times (e.g., "tomorrow at 9am", "next Monday") into a specific, future ISO 8601 format (YYYY-MM-DDTHH:mm:ss.sssZ) based on the current date and time provided above. If no time is specified, default to a reasonable time like 9:00 AM local time. If no reminder is mentioned, use 'not set'.
        - [Priority]: The urgency (High, Medium, Low, or None). Infer from language (e.g., "urgent", "ASAP" is High; "when you have time" is Low). If ambiguous, set to 'None'.
@@ -63,9 +63,9 @@ export const processNote = async (note: string, existingItems: ActionItem[]): Pr
        - [Task Type]: The category of the task. Must be one of 'Self', 'Delegated', 'Team', 'Personal'. Infer this from the context. "I need to..." is 'Self'. "Tell Bob to..." is 'Delegated'. "We should..." is 'Team'. If a task seems non-work-related, use 'Personal'. If ambiguous, default to 'Self'.
        - The user's input is the [Source].
     4. Handling Missing Information (MANDATORY):
-       - If a task is found with NO deadline: You MUST ask for it. Example: "I've noted the task: 'Send the client proposal.' What's the deadline for that?"
-       - If the transcript has NO clear task: You MUST ask for clarification. Example: "Got it. Were there any specific action items or deadlines from that part you'd like me to record?"
-    5. The Cumulative Loop (MANDATORY): After processing, you MUST end your response by asking: "Noted. Do you have more to add, or would you like me to generate the final summary?"
+       - If a task is found with NO deadline: You MUST ask for it in English. Example: "I've noted the task: 'Send the client proposal.' What's the deadline for that?"
+       - If the transcript has NO clear task: You MUST ask for clarification in English. Example: "Got it. Were there any specific action items or deadlines from that part you'd like me to record?"
+    5. The Cumulative Loop (MANDATORY): After processing, you MUST end your response by asking in English: "Noted. Do you have more to add, or would you like me to generate the final summary?"
 
     Current Action Items: ${JSON.stringify(existingItems.map(({id, ...rest}) => rest))}
     New User Note: "${note}"
@@ -84,11 +84,11 @@ export const processNote = async (note: string, existingItems: ActionItem[]): Pr
                 properties: {
                     newItems: {
                         type: Type.ARRAY,
-                        description: "A list of new action items found in the user's note.",
+                        description: "A list of new action items found in the user's note. All text fields MUST be translated to English.",
                         items: {
                             type: Type.OBJECT,
                             properties: {
-                                task: { type: Type.STRING, description: "The specific action item." },
+                                task: { type: Type.STRING, description: "The specific action item, TRANSLATED to English." },
                                 deadline: { type: Type.STRING, description: "The deadline for the task. Use 'not specified' if not found." },
                                 reminder: { type: Type.STRING, description: "The reminder for the task in ISO 8601 format (YYYY-MM-DDTHH:mm:ss.sssZ). Use 'not set' if not specified." },
                                 priority: { type: Type.STRING, description: "The priority of the task (High, Medium, Low, or None)." },
@@ -102,7 +102,7 @@ export const processNote = async (note: string, existingItems: ActionItem[]): Pr
                     },
                     responseText: {
                         type: Type.STRING,
-                        description: "Your full response to the user, strictly following the persona rules for clarification and the cumulative loop question."
+                        description: "Your full response to the user, STRICTLY in English, following the persona rules for clarification and the cumulative loop question."
                     }
                 },
                 required: ["newItems", "responseText"]
@@ -123,9 +123,14 @@ export const updateActionItem = async (itemToUpdate: ActionItem, updateInstructi
 
 Your task is to parse the user's instructions and return a complete, updated JSON object for the action item.
 
+**CRITICAL RULE: STRICTLY ENGLISH**
+You must process all instructions and ensure any text output or updated strings are in English. 
+If the user's instruction is in another language, you MUST TRANSLATE the intent and the resulting task details into English.
+If the 'Current Item' is in another language, TRANSLATE the fields to English during this update.
+
 **Rules for Updating:**
 1.  **Analyze the instruction:** Determine which fields ('task', 'deadline', 'priority', 'responsible', 'status', 'type', 'reminder') the user wants to change.
-2.  **Preserve unchanged fields:** If a field is not mentioned in the instruction, you MUST retain its original value from the "Current Item". This is critical for partial updates.
+2.  **Preserve unchanged fields:** If a field is not mentioned in the instruction, you MUST retain its original value from the "Current Item".
 3.  **'source' is immutable:** The 'source' field MUST NOT be changed under any circumstances. The 'id' field is managed by the system and should not be in your output.
 4.  **Handle 'responsible':** If the instruction is about assigning the task (e.g., "assign to [Name]", "[Name] is responsible for this", "make [Name] the owner"), update the \`responsible\` field to "[Name]". If they say "unassign it", set it to "Unassigned".
 5.  **Handle 'status':** If the user says "mark as complete", "it's done", etc., set \`status\` to "Completed". If they say "I'm starting on this", "in progress", set it to "In Progress".
@@ -135,8 +140,8 @@ Your task is to parse the user's instructions and return a complete, updated JSO
 
 **Example 1 (Multiple fields):**
 - Current Item: {"task":"Submit report","deadline":"EOD Friday","reminder":"not set", "priority":"High","responsible":"Alex","status":"Not Started", "source":"...", "type": "Self"}
-- User's Instructions: "Change the deadline to Monday, and remind me at 8am that day."
-- Expected Output (JSON only): {"task":"Submit report","deadline":"Monday","reminder":"[ISO 8601 for next Monday at 8am]","priority":"High","responsible":"Alex","status":"Not Started", "source":"...", "type":"Self"}`;
+- User's Instructions: "Cambiar la fecha límite al lunes y recordarme a las 8am ese día." (Spanish Input)
+- Expected Output (JSON only, Translated): {"task":"Submit report","deadline":"Monday","reminder":"[ISO 8601 for next Monday at 8am]","priority":"High","responsible":"Alex","status":"Not Started", "source":"...", "type":"Self"}`;
     
     const response = await generateContentWithRetry({
         model: 'gemini-2.5-flash',
@@ -147,7 +152,7 @@ Your task is to parse the user's instructions and return a complete, updated JSO
             responseSchema: {
                 type: Type.OBJECT,
                 properties: {
-                    task: { type: Type.STRING, description: "The updated action item text." },
+                    task: { type: Type.STRING, description: "The updated action item text, TRANSLATED to English." },
                     deadline: { type: Type.STRING, description: "The updated deadline for the task." },
                     reminder: { type: Type.STRING, description: "The updated reminder for the task in ISO 8601 format (YYYY-MM-DDTHH:mm:ss.sssZ). Use 'not set' if not specified." },
                     priority: { type: Type.STRING, description: "The updated priority of the task (High, Medium, Low, or None)." },
@@ -168,7 +173,12 @@ Your task is to parse the user's instructions and return a complete, updated JSO
 
 export const generateSummary = async (items: ActionItem[]): Promise<string> => {
     const prompt = `Generate a complete "Actionable Work Summary" in English based on the following list of action items.
-    The entire summary, including the overview and the bulleted list, MUST be in English.
+    
+    **LANGUAGE RULE: STRICTLY ENGLISH**
+    The entire summary MUST be in English. 
+    If any action items in the provided list are written in another language, you MUST TRANSLATE them into English for this summary.
+    Do not output any other language.
+
     The summary must have two parts:
     1. Overview: A 1-2 sentence narrative summary of the work identified.
     2. Action Items: A clear, bulleted list of all tasks.
@@ -195,7 +205,8 @@ export const generateExportContent = async (items: ActionItem[], format: ExportF
     
     switch (format) {
         case 'markdown':
-            prompt = `Generate a complete "Actionable Work Summary" in Markdown format, written in English, based on the following list of action items.
+            prompt = `Generate a complete "Actionable Work Summary" in Markdown format, written STRICTLY in English, based on the following list of action items.
+If any items are in another language, TRANSLATE them to English.
 The summary must have two parts:
 1. Overview: A 1-2 sentence narrative summary of the work identified, written in English.
 2. Action Items: A clear, bulleted list of all tasks, formatted as Markdown, including their type, status, priority, reminder, and the person responsible. All text must be in English.
@@ -205,6 +216,7 @@ ${JSON.stringify(items)}`;
             break;
         case 'json':
             prompt = `Convert the following list of action items into a valid JSON array. The JSON should include "task", "status", "responsible", "priority", "deadline", "reminder", "source", and "type".
+**TRANSLATION RULE:** Ensure all values (especially 'task' and 'responsible') are in English. Translate if necessary.
 The output should ONLY be the JSON data, enclosed in a markdown JSON code block.
 ---
 Action Items List:
@@ -212,6 +224,8 @@ ${JSON.stringify(items)}`;
             break;
         case 'csv':
             prompt = `Convert the following list of action items into a robust, RFC 4180 compliant CSV format.
+**TRANSLATION RULE:** Ensure all text content is in English. Translate 'task' descriptions if they are in another language.
+
 The output should ONLY be the CSV data, enclosed in a markdown code block.
 
 **CSV Generation Rules (MUST be followed):**
