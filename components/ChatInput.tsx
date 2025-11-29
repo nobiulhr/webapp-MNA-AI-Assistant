@@ -225,17 +225,26 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         return;
     }
     
+    // Update state immediately to give feedback and trigger cleanup of wake word listener via useEffect
+    setListeningState('initializing_audio');
+
     // Stop wake word listener and wait a bit for the OS to release the microphone
     stopWakeWordListener();
     await new Promise(resolve => setTimeout(resolve, 300));
 
     try {
-        setListeningState('requesting_permission');
+        // If we still need to request permission (e.g. first time), update state for clearer feedback
+        if (micPermission !== 'granted') {
+            setListeningState('requesting_permission');
+        }
+
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         mediaStreamRef.current = stream;
         setMicPermission('granted');
-
+        
+        // Ensure state is back to initializing/connecting after gum resolves
         setListeningState('initializing_audio');
+
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
         
         const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -389,7 +398,7 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         const lower = transcript.toLowerCase();
         
         // Check for wake word
-        if (/\b(hey|start)\b/i.test(lower)) {
+        if (/\b(hey|start|mna|ok)\b/i.test(lower)) {
             setShouldStartListening(true);
             recognition.abort(); // Immediately stop/release mic once detected
         }
@@ -549,7 +558,7 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
         return "Connection error. Click mic to retry.";
     }
     if (micPermission === 'granted') {
-        return "Say 'Hey' or 'Start' to activate, or click the mic...";
+        return "Say 'Hey', 'Start', or 'MNA' to activate...";
     }
     return "Click the mic to start speaking...";
   };
@@ -573,7 +582,7 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSend, isLoading, onError }) => 
                return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-red-900/40 text-red-300 rounded-full border border-red-500/30">Connection Failed</span>;
            case 'idle':
                if (micPermission === 'granted') {
-                    return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-emerald-500/10 text-emerald-400 rounded-full border border-emerald-500/20">Wake Word Active: "Hey" or "Start"</span>;
+                    return <span className="absolute -top-8 left-0 text-xs font-semibold px-2 py-1 bg-emerald-500/10 text-emerald-400 rounded-full border border-emerald-500/20">Wake Word: "Hey", "Start", "MNA"</span>;
                }
                return null;
           default:
